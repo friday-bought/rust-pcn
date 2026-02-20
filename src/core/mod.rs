@@ -677,7 +677,7 @@ impl PCN {
             let mut mu_l_minus_1 = f_x_l.dot(&self.w[l].t());
 
             // Add bias to each row: mu_l_minus_1 += b[l-1] (broadcast)
-            for row in mu_l_minus_1.rows_mut() {
+            for mut row in mu_l_minus_1.rows_mut() {
                 row += &self.b[l - 1];
             }
 
