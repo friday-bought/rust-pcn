@@ -521,65 +521,6 @@ impl PCN {
         self.relax_with_convergence(state, max_steps, alpha, 1e-5, 1e-6)
     }
 
-    /// Relax the network with convergence-based stopping.
-    ///
-    /// # Algorithm
-    ///
-    /// Relaxes until either:
-    /// 1. Energy change falls below `threshold` (convergence detected)
-    /// 2. Maximum steps `max_steps` is reached (safety limit)
-    ///
-    /// Returns the number of relaxation steps actually taken.
-    ///
-    /// # Arguments
-    /// - `state`: network state to relax
-    /// - `threshold`: convergence threshold (typically 1e-6 to 1e-4)
-    /// - `max_steps`: maximum number of relaxation steps (safety limit, typically 200-500)
-    /// - `alpha`: state update rate (typically 0.01-0.1)
-    ///
-    /// # Returns
-    /// Number of steps taken before convergence or max_steps
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let steps_taken = network.relax_with_convergence(
-    ///     &mut state,
-    ///     1e-5,    // stop when energy change < 1e-5
-    ///     200,     // never exceed 200 steps
-    ///     0.05     // relaxation rate
-    /// )?;
-    /// println!("Converged in {} steps", steps_taken);
-    /// ```
-    pub fn relax_with_convergence(
-        &self,
-        state: &mut State,
-        threshold: f32,
-        max_steps: usize,
-        alpha: f32,
-    ) -> PCNResult<usize> {
-        self.compute_errors(state)?;
-        let mut prev_energy = self.compute_energy(state);
-
-        for step in 0..max_steps {
-            self.relax_step(state, alpha)?;
-            self.compute_errors(state)?;
-
-            let curr_energy = self.compute_energy(state);
-            let energy_change = (prev_energy - curr_energy).abs();
-
-            // Check convergence
-            if energy_change < threshold {
-                return Ok(step + 1);
-            }
-
-            prev_energy = curr_energy;
-        }
-
-        // Reached max_steps without convergence
-        Ok(max_steps)
-    }
-
     /// Update weights using the Hebbian learning rule.
     ///
     /// # Algorithm
