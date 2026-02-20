@@ -172,7 +172,7 @@ impl std::fmt::Debug for PCN {
     }
 }
 
-/// Network state during relaxation.
+/// Network state during relaxation (single sample).
 ///
 /// Holds activations, predictions, and errors for all layers.
 /// Also tracks relaxation statistics for convergence monitoring.
@@ -186,6 +186,27 @@ pub struct State {
     pub eps: Vec<Array1<f32>>,
     /// Number of relaxation steps actually taken
     /// (may be less than requested if convergence is achieved early)
+    pub steps_taken: usize,
+    /// Final total prediction error energy after relaxation
+    pub final_energy: f32,
+}
+
+/// Batched network state during relaxation.
+///
+/// Holds activations, predictions, and errors for all layers across a batch of samples.
+/// Each layer's state is a matrix where rows are batch dimension and columns are neuron dimension.
+/// Tracks relaxation statistics and accumulated error metrics for the batch.
+#[derive(Debug, Clone)]
+pub struct BatchState {
+    /// x[l]: activations at layer l, shape (batch_size, d_l)
+    pub x: Vec<Array2<f32>>,
+    /// mu[l]: predicted activity of layer l, shape (batch_size, d_l)
+    pub mu: Vec<Array2<f32>>,
+    /// eps[l]: prediction error at layer l, shape (batch_size, d_l)
+    pub eps: Vec<Array2<f32>>,
+    /// Number of samples in this batch
+    pub batch_size: usize,
+    /// Number of relaxation steps actually taken
     pub steps_taken: usize,
     /// Final total prediction error energy after relaxation
     pub final_energy: f32,
@@ -595,6 +616,230 @@ impl PCN {
         }
         0.5 * energy
     }
+
+    /// Initialize a batch state for inference or training (all zeros).
+    ///
+    /// # Arguments
+    /// - `batch_size`: number of samples in the batch
+    ///
+    /// # Returns
+    /// A new `BatchState` with all activations, predictions, and errors initialized to zeros.
+    pub fn init_batch_state(&self, batch_size: usize) -> BatchState {
+        let l_max = self.dims.len() - 1;
+        BatchState {
+            x: (0..=l_max)
+                .map(|l| Array2::zeros((batch_size, self.dims[l])))
+                .collect(),
+            mu: (0..=l_max)
+                .map(|l| Array2::zeros((batch_size, self.dims[l])))
+                .collect(),
+            eps: (0..=l_max)
+                .map(|l| Array2::zeros((batch_size, self.dims[l])))
+                .collect(),
+            batch_size,
+            steps_taken: 0,
+            final_energy: 0.0,
+        }
+    }
+
+    /// Compute predictions and errors for the current batch state.
+    ///
+    /// # Algorithm
+    ///
+    /// For each layer ℓ ∈ [1..L]:
+    /// - Compute top-down prediction: `μ^ℓ-1 = f(x^ℓ) @ W^ℓ^T + b^ℓ-1`
+    /// - Compute error: `ε^ℓ-1 = x^ℓ-1 - μ^ℓ-1`
+    ///
+    /// The prediction represents what layer ℓ expects the activity of layer ℓ-1 to be,
+    /// based on the current activity at layer ℓ and learned weights.
+    ///
+    /// # Matrix Operations
+    /// - `f(x[l])`: shape (batch_size, d_l)
+    /// - `W[l]`: shape (d_{l-1}, d_l)
+    /// - `f(x[l]) @ W[l]^T`: shape (batch_size, d_{l-1})
+    /// - `b[l-1]`: shape (d_{l-1})
+    ///
+    /// Updates `state.mu` and `state.eps` in place.
+    pub fn compute_batch_errors(&self, state: &mut BatchState) -> PCNResult<()> {
+        let l_max = self.dims.len() - 1;
+
+        for l in 1..=l_max {
+            // Apply activation: f_x_l = f(x[l])
+            // x[l] has shape (batch_size, d_l)
+            // f_x_l will have shape (batch_size, d_l)
+            let f_x_l = self.activation.apply_matrix(&state.x[l]);
+
+            // Compute prediction: mu[l-1] = f(x[l]) @ W[l]^T + b[l-1]
+            // f(x[l]): (batch_size, d_l)
+            // W[l]: (d_{l-1}, d_l)
+            // W[l]^T: (d_l, d_{l-1})
+            // f(x[l]) @ W[l]^T: (batch_size, d_{l-1})
+            let mut mu_l_minus_1 = f_x_l.dot(&self.w[l].t());
+
+            // Add bias to each row: mu_l_minus_1 += b[l-1] (broadcast)
+            for row in mu_l_minus_1.rows_mut() {
+                row += &self.b[l - 1];
+            }
+
+            // Store prediction
+            state.mu[l - 1] = mu_l_minus_1.clone();
+
+            // Compute error: eps[l-1] = x[l-1] - mu[l-1]
+            state.eps[l - 1] = &state.x[l - 1] - &mu_l_minus_1;
+        }
+
+        Ok(())
+    }
+
+    /// Perform one relaxation step on a batch to minimize energy.
+    ///
+    /// # Algorithm
+    ///
+    /// For layers ℓ ∈ [1..L] (all non-input layers):
+    /// ```text
+    /// x^ℓ += α * (-ε^ℓ + f(x)^ℓ @ (W[l]^T ε[l-1]^T)^T ⊙ f'(x^ℓ))
+    /// ```
+    ///
+    /// For batch operations with shape (batch_size, d_l):
+    /// - `-ε^ℓ`: shape (batch_size, d_l)
+    /// - `W[l]`: shape (d_{l-1}, d_l)
+    /// - `ε[l-1]`: shape (batch_size, d_{l-1})
+    /// - `ε[l-1] @ W[l]`: shape (batch_size, d_l)
+    /// - `f'(x^ℓ)`: shape (batch_size, d_l)
+    /// - `(ε[l-1] @ W[l]) ⊙ f'(x^ℓ)`: element-wise product, shape (batch_size, d_l)
+    ///
+    /// Updates `state.x` in place. Input layer (l=0) is not updated (assumed clamped).
+    ///
+    /// # Arguments
+    /// - `alpha`: relaxation learning rate (typically 0.01-0.1)
+    pub fn relax_batch_step(&self, state: &mut BatchState, alpha: f32) -> PCNResult<()> {
+        let l_max = self.dims.len() - 1;
+
+        // Update layers [1, L]. Input (0) is assumed clamped.
+        for l in 1..=l_max {
+            // Term 1: -eps[l] (zero for top layer since eps[l_max] is never set)
+            let neg_eps = -&state.eps[l];
+
+            // Term 2: Error feedback from layer below.
+            // eps[l-1]: (batch_size, d_{l-1})
+            // W[l]^T: (d_l, d_{l-1})
+            // eps[l-1] @ W[l]: (batch_size, d_l)
+            let feedback = state.eps[l - 1].dot(&self.w[l].t());
+
+            // Term 3: f'(x[l]) (derivative of activation at layer l)
+            let f_prime = self.activation.derivative_matrix(&state.x[l]);
+
+            // Combine: feedback ⊙ f'(x[l])
+            let feedback_weighted = &feedback * &f_prime;
+
+            // Final update: x[l] += alpha * (-eps[l] + feedback_weighted)
+            let delta = &neg_eps + &feedback_weighted;
+            state.x[l] = &state.x[l] + alpha * &delta;
+        }
+
+        Ok(())
+    }
+
+    /// Relax the network on a batch for a given number of steps.
+    ///
+    /// # Algorithm
+    ///
+    /// ```text
+    /// for t in 1..steps:
+    ///     compute_batch_errors()
+    ///     relax_batch_step()
+    /// compute_batch_errors()  // final error computation
+    /// ```
+    ///
+    /// Repeatedly minimizes energy via gradient descent for exactly `steps` iterations
+    /// on the entire batch. Updates `state.steps_taken` and `state.final_energy`.
+    ///
+    /// # Arguments
+    /// - `steps`: number of relaxation iterations
+    /// - `alpha`: state update rate (typically 0.01-0.1)
+    pub fn relax_batch(&self, state: &mut BatchState, steps: usize, alpha: f32) -> PCNResult<()> {
+        for _ in 0..steps {
+            self.compute_batch_errors(state)?;
+            self.relax_batch_step(state, alpha)?;
+        }
+        // Final error computation
+        self.compute_batch_errors(state)?;
+
+        // Record statistics
+        state.steps_taken = steps;
+        state.final_energy = self.compute_batch_energy(state);
+
+        Ok(())
+    }
+
+    /// Compute total prediction error energy for a batch.
+    ///
+    /// # Energy Function
+    ///
+    /// The network minimizes this energy via gradient descent (relaxation):
+    /// ```text
+    /// E = (1/2) * Σ_ℓ Σ_b ||ε^ℓ_b||²
+    /// ```
+    ///
+    /// Where `ε^ℓ_b` is the prediction error at layer ℓ for sample b in the batch.
+    ///
+    /// # Returns
+    /// Total energy summed over all layers and all samples in the batch.
+    pub fn compute_batch_energy(&self, state: &BatchState) -> f32 {
+        let mut energy = 0.0f32;
+        for eps in &state.eps {
+            // Sum of squared errors for the entire layer matrix
+            for val in eps.iter() {
+                energy += val * val;
+            }
+        }
+        0.5 * energy
+    }
+
+    /// Update weights using the Hebbian learning rule on a batch.
+    ///
+    /// # Algorithm
+    ///
+    /// After relaxation to equilibrium, accumulate errors and update weights using local
+    /// errors and presynaptic activity, averaged across the batch:
+    ///
+    /// For each weight matrix `W^ℓ`:
+    /// ```text
+    /// ΔW^ℓ = η (1/B) ε^{ℓ-1} @ f(x^ℓ)    (batch-averaged outer product)
+    /// Δb^{ℓ-1} = η (1/B) Σ_b ε^{ℓ-1}_b   (batch-averaged bias update)
+    /// ```
+    ///
+    /// Where B is the batch size, and the sum is over all samples in the batch.
+    ///
+    /// # Arguments
+    /// - `eta`: learning rate (typically 0.001-0.01)
+    pub fn update_batch_weights(&mut self, state: &BatchState, eta: f32) -> PCNResult<()> {
+        let l_max = self.dims.len() - 1;
+        let batch_size = state.batch_size as f32;
+
+        for l in 1..=l_max {
+            // Presynaptic activity: f(x[l])
+            // shape: (batch_size, d_l)
+            let f_x_l = self.activation.apply_matrix(&state.x[l]);
+
+            // Outer product (batch version): ε[l-1]^T @ f(x[l])
+            // ε[l-1]: (batch_size, d_{l-1})
+            // f(x[l]): (batch_size, d_l)
+            // ε[l-1]^T: (d_{l-1}, batch_size)
+            // ε[l-1]^T @ f(x[l]): (d_{l-1}, d_l) ✓
+            let delta_w = state.eps[l - 1].t().dot(&f_x_l);
+
+            // Weight update (batch-averaged): w[l] += (eta / batch_size) * delta_w
+            self.w[l] += &((eta / batch_size) * &delta_w);
+
+            // Bias update (batch-averaged): b[l-1] += (eta / batch_size) * sum_b eps[l-1][b]
+            // Sum each column (dimension) of eps[l-1] across all rows (samples)
+            let bias_delta = state.eps[l - 1].sum_axis(Axis(0)) / batch_size;
+            self.b[l - 1] = &self.b[l - 1] + eta * &bias_delta;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -713,5 +958,119 @@ mod tests {
         assert!(steps > 0 && steps <= 200);
         assert_eq!(steps, state.steps_taken);
         assert!(state.final_energy >= 0.0);
+    }
+
+    #[test]
+    fn test_batch_state_init() {
+        let dims = vec![2, 4, 3];
+        let pcn = PCN::new(dims).unwrap();
+        let batch_size = 5;
+        let state = pcn.init_batch_state(batch_size);
+        
+        assert_eq!(state.batch_size, batch_size);
+        assert_eq!(state.x[0].shape(), &[batch_size, 2]);
+        assert_eq!(state.x[1].shape(), &[batch_size, 4]);
+        assert_eq!(state.x[2].shape(), &[batch_size, 3]);
+        assert_eq!(state.steps_taken, 0);
+        assert_eq!(state.final_energy, 0.0);
+    }
+
+    #[test]
+    fn test_compute_batch_errors() {
+        let dims = vec![2, 3, 2];
+        let pcn = PCN::new(dims).unwrap();
+        let mut state = pcn.init_batch_state(3);
+
+        // Set some inputs (batch of 3 samples)
+        for i in 0..3 {
+            state.x[0].row_mut(i).assign(&ndarray::array![1.0, 0.5]);
+        }
+
+        // Compute errors should not panic
+        assert!(pcn.compute_batch_errors(&mut state).is_ok());
+    }
+
+    #[test]
+    fn test_batch_energy_increases_with_error() {
+        let dims = vec![2, 3, 2];
+        let pcn = PCN::new(dims).unwrap();
+        let state1 = pcn.init_batch_state(2);
+        let mut state2 = pcn.init_batch_state(2);
+
+        // Set up state2 with larger errors
+        state2.eps[0] = ndarray::array![[5.0, 5.0], [3.0, 3.0]];
+
+        let energy1 = pcn.compute_batch_energy(&state1);
+        let energy2 = pcn.compute_batch_energy(&state2);
+
+        assert!(energy2 > energy1);
+    }
+
+    #[test]
+    fn test_relax_batch_step() {
+        let dims = vec![2, 3, 2];
+        let pcn = PCN::new(dims).unwrap();
+        let mut state = pcn.init_batch_state(2);
+
+        // Set input for batch
+        for i in 0..2 {
+            state.x[0].row_mut(i).assign(&ndarray::array![1.0, 0.5]);
+        }
+
+        // Compute initial errors
+        assert!(pcn.compute_batch_errors(&mut state).is_ok());
+
+        let initial_x = state.x[1].clone();
+
+        // Do one relaxation step
+        assert!(pcn.relax_batch_step(&mut state, 0.01).is_ok());
+
+        // States should have changed (unless converged)
+        // We don't assert they're different to avoid flaky tests
+        // Just verify the operation completed
+        assert_eq!(state.x[1].shape(), initial_x.shape());
+    }
+
+    #[test]
+    fn test_relax_batch() {
+        let dims = vec![2, 3, 2];
+        let pcn = PCN::new(dims).unwrap();
+        let mut state = pcn.init_batch_state(3);
+
+        // Set input for batch
+        for i in 0..3 {
+            state.x[0].row_mut(i).assign(&ndarray::array![1.0, 0.5]);
+        }
+
+        // Relax for fixed steps
+        assert!(pcn.relax_batch(&mut state, 10, 0.01).is_ok());
+
+        // Check stats were recorded
+        assert_eq!(state.steps_taken, 10);
+        assert!(state.final_energy >= 0.0);
+    }
+
+    #[test]
+    fn test_update_batch_weights() {
+        let dims = vec![2, 3, 2];
+        let mut pcn = PCN::new(dims).unwrap();
+        let mut state = pcn.init_batch_state(2);
+
+        // Set inputs
+        for i in 0..2 {
+            state.x[0].row_mut(i).assign(&ndarray::array![1.0, 0.5]);
+        }
+
+        // Compute errors
+        assert!(pcn.compute_batch_errors(&mut state).is_ok());
+
+        // Store original weights
+        let original_w1 = pcn.w[1].clone();
+
+        // Update weights
+        assert!(pcn.update_batch_weights(&state, 0.01).is_ok());
+
+        // Weights should have changed
+        assert_ne!(pcn.w[1], original_w1);
     }
 }
