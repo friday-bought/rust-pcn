@@ -551,14 +551,40 @@ fn test_deterministic_error_computation() {
 }
 
 // ============================================================================
-// PHASE 2 INTEGRATION TESTS WITH TANH
+// PHASE 2 INTEGRATION TESTS WITH TANH - HELPER UTILITIES
 // ============================================================================
+
+/// Generate XOR training dataset.
+///
+/// Standard XOR problem with 2 binary inputs and 1 binary output.
+/// This is the classic nonlinearly separable problem in machine learning.
+///
+/// Truth table:
+/// - (0, 0) → 0
+/// - (0, 1) → 1
+/// - (1, 0) → 1
+/// - (1, 1) → 0
+fn generate_xor_data() -> Vec<(ndarray::Array1<f32>, f32)> {
+    vec![
+        (ndarray::arr1(&[0.0, 0.0]), 0.0),
+        (ndarray::arr1(&[0.0, 1.0]), 1.0),
+        (ndarray::arr1(&[1.0, 0.0]), 1.0),
+        (ndarray::arr1(&[1.0, 1.0]), 0.0),
+    ]
+}
 
 /// Generate 2D spiral dataset for nonlinear separability test.
 ///
 /// Creates a spiral pattern where points rotate around origin with distance
 /// determining the target class. This is a classic nonlinearly separable problem.
-fn generate_spiral(n_points: usize, n_turns: usize) -> Vec<(ndarray::Array1<f32>, f32)> {
+///
+/// # Parameters
+/// - `n_points`: number of samples to generate
+/// - `n_turns`: number of complete spiral rotations
+///
+/// # Returns
+/// Vector of (input: [x, y], target: class ∈ {0, 1})
+fn generate_spiral_data(n_points: usize, n_turns: usize) -> Vec<(ndarray::Array1<f32>, f32)> {
     let mut data = Vec::new();
 
     for i in 0..n_points {
@@ -581,6 +607,139 @@ fn generate_spiral(n_points: usize, n_turns: usize) -> Vec<(ndarray::Array1<f32>
     }
 
     data
+}
+
+/// Legacy alias for backwards compatibility
+fn generate_spiral(n_points: usize, n_turns: usize) -> Vec<(ndarray::Array1<f32>, f32)> {
+    generate_spiral_data(n_points, n_turns)
+}
+
+/// Train a network and report accuracy and convergence statistics.
+///
+/// This helper function encapsulates the full training-and-test loop:
+/// 1. Train for specified epochs on training data
+/// 2. Evaluate accuracy on same data
+/// 3. Print convergence metrics: steps taken, final energy, accuracy
+///
+/// # Parameters
+/// - `network`: mutable PCN to train
+/// - `training_data`: list of (input, target) samples
+/// - `config`: training configuration (relax_steps, alpha, eta, clamp_output)
+/// - `num_epochs`: number of training epochs
+/// - `test_name`: descriptive name for logging
+///
+/// # Returns
+/// Tuple of (final_accuracy: f32, avg_energy_decrease: f32, avg_steps: f32)
+fn train_and_report(
+    network: &mut PCN,
+    training_data: &[(ndarray::Array1<f32>, f32)],
+    config: Config,
+    num_epochs: usize,
+    test_name: &str,
+) -> (f32, f32, f32) {
+    let mut epoch_energies = Vec::new();
+    let mut total_steps = 0usize;
+
+    println!("\n{}: Starting training ({} epochs, {} samples/epoch)", 
+             test_name, num_epochs, training_data.len());
+
+    // ===== TRAINING PHASE =====
+    for epoch in 0..num_epochs {
+        let mut epoch_energy = 0.0;
+        let mut epoch_steps = 0usize;
+
+        for (input, target) in training_data {
+            let mut state = network.init_state();
+            state.x[0] = input.clone();
+
+            // Relax for equilibrium
+            for _ in 0..config.relax_steps {
+                network
+                    .compute_errors(&mut state)
+                    .expect("Error computation failed");
+                network
+                    .relax_step(&mut state, config.alpha)
+                    .expect("Relaxation failed");
+
+                if config.clamp_output {
+                    state.x[state.x.len() - 1] = ndarray::arr1(&[*target]);
+                }
+            }
+
+            network
+                .compute_errors(&mut state)
+                .expect("Error computation failed");
+
+            epoch_energy += network.compute_energy(&state);
+            epoch_steps += state.steps_taken;
+
+            network
+                .update_weights(&state, config.eta)
+                .expect("Weight update failed");
+        }
+
+        let avg_energy = epoch_energy / training_data.len() as f32;
+        epoch_energies.push(avg_energy);
+        total_steps += epoch_steps;
+
+        if epoch % (num_epochs.max(10) / 10) == 0 || epoch == num_epochs - 1 {
+            println!(
+                "  Epoch {:>3}/{}: Avg Energy = {:.6}",
+                epoch, num_epochs - 1, avg_energy
+            );
+        }
+    }
+
+    // ===== EVALUATION PHASE =====
+    let mut correct = 0;
+    for (input, target) in training_data {
+        let mut state = network.init_state();
+        state.x[0] = input.clone();
+
+        for _ in 0..config.relax_steps {
+            network
+                .compute_errors(&mut state)
+                .expect("Error computation failed");
+            network
+                .relax_step(&mut state, config.alpha)
+                .expect("Relaxation failed");
+        }
+        network
+            .compute_errors(&mut state)
+            .expect("Error computation failed");
+
+        let output = state.x[state.x.len() - 1][0];
+        let prediction = if output > 0.5 { 1.0 } else { 0.0 };
+
+        if (prediction - target).abs() < 1e-1 {
+            correct += 1;
+        }
+    }
+
+    let accuracy = correct as f32 / training_data.len() as f32;
+    let initial_energy = epoch_energies[0];
+    let final_energy = epoch_energies[num_epochs - 1];
+    let energy_decrease = initial_energy - final_energy;
+    let avg_steps = total_steps as f32 / (num_epochs * training_data.len()) as f32;
+
+    println!(
+        "{}: FINAL REPORT",
+        test_name
+    );
+    println!(
+        "  Accuracy: {:.2}% ({}/{} correct)",
+        accuracy * 100.0, correct, training_data.len()
+    );
+    println!(
+        "  Energy: initial={:.6}, final={:.6}, decrease={:.6}",
+        initial_energy, final_energy, energy_decrease
+    );
+    println!(
+        "  Convergence: avg {:.1} steps per sample (max {})",
+        avg_steps, config.relax_steps
+    );
+
+    (accuracy, energy_decrease, avg_steps)
 }
 
 /// Test 2D spiral problem with tanh (nonlinear separability).
