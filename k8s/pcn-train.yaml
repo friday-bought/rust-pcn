@@ -49,6 +49,7 @@ spec:
         --books-dir data/books \
         --checkpoint-dir data/checkpoints \
         --metrics-file data/output/metrics.jsonl \
+        --gpu \
         --epochs 2 \
         --max-samples-per-book 5000 \
         --batch-size 512 \
