@@ -52,7 +52,7 @@ spec:
         --gpu \
         --epochs 2 \
         --max-samples-per-book 5000 \
-        --batch-size 512 \
+        --batch-size 8192 \
         --books-per-round 1
     env:
     - name: TZ

@@ -148,17 +148,27 @@ pub fn update_weights_gpu<B: Backend>(
     }
 }
 
-/// Compute batch energy on GPU and return as f32.
+/// Compute batch energy on GPU, staying on device (no CPU sync).
 ///
-/// E = 0.5 * sum(eps^2)
-pub fn compute_batch_energy_gpu<B: Backend>(state: &GpuBatchState<B>) -> f32 {
-    // Accumulate all squared errors on GPU, then sync once
+/// Returns a scalar tensor: 0.5 * sum(eps^2)
+pub fn compute_batch_energy_gpu_tensor<B: Backend>(state: &GpuBatchState<B>) -> Tensor<B, 1> {
     let mut iter = state.eps.iter();
     let first = iter.next().expect("at least one layer");
     let mut acc = first.clone().mul(first.clone()).sum();
     for eps in iter {
         acc = acc + eps.clone().mul(eps.clone()).sum();
     }
-    let scalar = acc.into_data().to_vec::<f32>().expect("scalar")[0];
-    0.5 * scalar
+    acc.mul_scalar(0.5)
+}
+
+/// Read a scalar energy tensor back to CPU. Call this as rarely as possible.
+pub fn read_energy_scalar<B: Backend>(energy: &Tensor<B, 1>) -> f32 {
+    energy.clone().into_data().to_vec::<f32>().expect("scalar")[0]
+}
+
+/// Compute batch energy on GPU and return as f32 (convenience wrapper, causes GPU->CPU sync).
+///
+/// E = 0.5 * sum(eps^2)
+pub fn compute_batch_energy_gpu<B: Backend>(state: &GpuBatchState<B>) -> f32 {
+    read_energy_scalar(&compute_batch_energy_gpu_tensor(state))
 }

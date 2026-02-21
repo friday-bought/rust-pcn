@@ -17,9 +17,12 @@ use crate::Config;
 
 use convert::{ndarray1_to_tensor, ndarray2_to_tensor, tensor_to_ndarray1, tensor_to_ndarray2};
 use tensors::{
-    compute_batch_energy_gpu, compute_errors_gpu, init_state_from_input_gpu, relax_step_gpu,
-    update_weights_gpu,
+    compute_batch_energy_gpu_tensor, compute_errors_gpu, init_state_from_input_gpu,
+    read_energy_scalar, relax_step_gpu, update_weights_gpu,
 };
+// Re-export for tests and external callers
+#[allow(unused_imports)]
+pub use tensors::compute_batch_energy_gpu;
 
 /// GPU-accelerated PCN holding burn tensors on device.
 pub struct GpuPcn<B: Backend> {
@@ -106,8 +109,8 @@ pub fn train_epoch_gpu<B: Backend>(
     let num_batches = num_samples.div_ceil(batch_size);
     let device = &gpu_pcn.device.clone();
 
-    let mut all_batch_losses = Vec::new();
-    let mut total_energy = 0.0f32;
+    let mut batch_energy_tensors: Vec<Tensor<B, 1>> = Vec::with_capacity(num_batches);
+    let mut batch_sizes: Vec<usize> = Vec::with_capacity(num_batches);
 
     // Shuffle indices and reorder on CPU (single memcpy)
     let mut indices: Vec<usize> = (0..num_samples).collect();
@@ -178,11 +181,9 @@ pub fn train_epoch_gpu<B: Backend>(
         // Final error computation
         compute_errors_gpu(&mut state, &gpu_pcn.w, &gpu_pcn.b, l_max);
 
-        // Compute batch energy (single GPU->CPU sync per batch)
-        let batch_energy = compute_batch_energy_gpu(&state);
-        let avg_batch_energy = batch_energy / current_batch_size as f32;
-        total_energy += batch_energy;
-        all_batch_losses.push(avg_batch_energy);
+        // Compute batch energy on GPU (no CPU sync — stays on device)
+        batch_energy_tensors.push(compute_batch_energy_gpu_tensor(&state));
+        batch_sizes.push(current_batch_size);
 
         // Update weights on GPU (stays on device)
         update_weights_gpu(
@@ -205,6 +206,16 @@ pub fn train_epoch_gpu<B: Backend>(
         }
     }
 
+    // Single GPU->CPU sync for all energy values at end of epoch
+    let all_batch_losses: Vec<f32> = batch_energy_tensors
+        .iter()
+        .zip(batch_sizes.iter())
+        .map(|(e, &bs)| read_energy_scalar(e) / bs as f32)
+        .collect();
+    let total_energy: f32 = batch_energy_tensors
+        .iter()
+        .map(|e| read_energy_scalar(e))
+        .sum();
     let avg_loss = total_energy / num_samples as f32;
 
     Ok(EpochMetrics {
