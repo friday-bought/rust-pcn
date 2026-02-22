@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcn-train-v2
+  namespace: pcn-train
+  labels:
+    app: pcn-train
+    variant: v2
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - theshire
+  containers:
+    - name: pcn-train
+      image: ubuntu:24.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          echo "=== PCN V2 Training: Adaptive Encoding + Depth Fixes ==="
+          echo "Starting at $(date)"
+          echo ""
+          echo "GPU check:"
+          nvidia-smi || echo "No nvidia-smi"
+          echo ""
+          echo "Running training..."
+          cd /workspace
+          exec ./target/release/pcn-train \
+            --books-dir data/books \
+            --checkpoint-dir data/checkpoints/v2 \
+            --metrics-file data/output/metrics-v2.jsonl \
+            --gpu \
+            --epochs 40 \
+            --max-samples-per-book 10000 \
+            --batch-size 512 \
+            --books-per-round 1 \
+            --hidden-sizes 512,384,256 \
+            --window-size 32 \
+            --relax-steps 100 \
+            --alpha 0.025 \
+            --eta 0.02 \
+            --eta-per-layer "0.02,0.04,0.06,0.02" \
+            --eval-every 5 \
+            --seal \
+            --seal-ema-decay 0.3 \
+            --seal-sensitivity 2.0 \
+            --seal-min-mod 0.5 \
+            --seal-max-mod 1.8 \
+            --seal-boundary-blend 0.5 \
+            --adaptive-encoding \
+            --adaptive-encoding-threshold 0.5 \
+            --boundary-warmup-epochs 3 \
+            --boundary-warmup-lr-factor 0.3 \
+            --energy-accuracy-monitor \
+            --energy-accuracy-window 5 \
+            --ollama-url http://ollama.pcn-train.svc.cluster.local:11434 \
+            --ollama-model llama3.2:3b \
+            --curriculum /config/curriculum.toml \
+            --buffer-capacity 16 \
+            --ollama-epochs 10 \
+            --checkpoint-every 50
+      env:
+        - name: TZ
+          value: America/New_York
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: all
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: RUST_BACKTRACE
+          value: "1"
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib
+      resources:
+        requests:
+          cpu: "2"
+          memory: "2Gi"
+        limits:
+          cpu: "4"
+          memory: "16Gi"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: cuda-13-0
+          mountPath: /usr/local/cuda-13.0
+          readOnly: true
+        - name: cuda-13-1
+          mountPath: /usr/local/cuda
+          readOnly: true
+        - name: curriculum
+          mountPath: /config
+          readOnly: true
+      workingDir: /workspace
+  volumes:
+    - name: workspace
+      hostPath:
+        path: /home/kadajett/dev/rust-pcn
+        type: Directory
+    - name: cuda-13-0
+      hostPath:
+        path: /usr/local/cuda-13.0
+        type: Directory
+    - name: cuda-13-1
+      hostPath:
+        path: /usr/local/cuda-13.1
+        type: Directory
+    - name: curriculum
+      configMap:
+        name: curriculum-config

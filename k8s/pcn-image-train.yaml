@@ -1,0 +1,148 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcn-image-train
+  namespace: pcn-train
+  labels:
+    app: pcn-train
+    variant: image-v1
+    modality: vision
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+
+  # Schedule on theshire (has RTX 3050 6GB)
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - theshire
+
+  # Init container: download CIFAR-10 if not already present
+  initContainers:
+    - name: download-cifar10
+      image: ubuntu:24.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "=== CIFAR-10 Dataset Check ==="
+          DATASET_DIR="/datasets/cifar-10/cifar-10-batches-bin"
+
+          if [ -f "${DATASET_DIR}/data_batch_1.bin" ]; then
+            echo "Dataset already present at ${DATASET_DIR}"
+            ls -la "${DATASET_DIR}/"
+            echo "Skipping download."
+            exit 0
+          fi
+
+          echo "Dataset not found. Running download script..."
+          apt-get update -qq && apt-get install -y -qq curl 2>/dev/null | tail -1
+          bash /datasets/download-cifar10.sh /datasets
+          echo "Download complete."
+      volumeMounts:
+        - name: datasets
+          mountPath: /datasets
+
+  containers:
+    - name: pcn-image-train
+      image: ubuntu:24.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║   PCN Image Training: CIFAR-10 Reconstruction V1    ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+          echo "Starting at $(date)"
+          echo ""
+
+          echo "GPU check:"
+          nvidia-smi || echo "No nvidia-smi (running CPU-only)"
+          echo ""
+
+          # Verify dataset
+          DATASET_DIR="/datasets/cifar-10/cifar-10-batches-bin"
+          if [ ! -f "${DATASET_DIR}/data_batch_1.bin" ]; then
+            echo "ERROR: CIFAR-10 dataset not found at ${DATASET_DIR}"
+            exit 1
+          fi
+          echo "Dataset verified at ${DATASET_DIR}"
+          echo ""
+
+          echo "Running image PCN training..."
+          cd /workspace
+          exec ./target/release/pcn-train-image \
+            --data-dir "${DATASET_DIR}" \
+            --checkpoint-dir data/checkpoints/image-v1 \
+            --metrics-file data/output/metrics-image.jsonl \
+            --mode reconstruction \
+            --epochs 100 \
+            --batch-size 256 \
+            --relax-steps 80 \
+            --alpha 0.025 \
+            --eta 0.015 \
+            --eta-per-layer "0.015,0.03,0.045,0.015" \
+            --hidden-sizes 512,384,256 \
+            --patch-size 8 \
+            --eval-every 5 \
+            --buffer-capacity 512 \
+            --checkpoint-every 25
+      env:
+        - name: TZ
+          value: America/New_York
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: all
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: RUST_BACKTRACE
+          value: "1"
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib
+        # Control Rayon thread pool size to match pod CPU limits
+        - name: RAYON_NUM_THREADS
+          value: "4"
+      resources:
+        requests:
+          cpu: "2"
+          memory: "2Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          # Uncomment when GPU training is needed (currently CPU-only PCN core)
+          # nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: datasets
+          mountPath: /datasets
+        - name: cuda-13-0
+          mountPath: /usr/local/cuda-13.0
+          readOnly: true
+        - name: cuda-13-1
+          mountPath: /usr/local/cuda
+          readOnly: true
+      workingDir: /workspace
+
+  volumes:
+    - name: workspace
+      hostPath:
+        path: /home/kadajett/dev/rust-pcn
+        type: Directory
+    - name: datasets
+      hostPath:
+        path: /bulk-storage/datasets/images
+        type: DirectoryOrCreate
+    - name: cuda-13-0
+      hostPath:
+        path: /usr/local/cuda-13.0
+        type: Directory
+    - name: cuda-13-1
+      hostPath:
+        path: /usr/local/cuda-13.1
+        type: Directory

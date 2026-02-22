@@ -1,7 +1,13 @@
 //! Dataset loading and preprocessing.
 //!
-//! Handles loading from local files in /bulk-storage/localdocs,
+//! Handles loading from local files in /bulk-storage,
 //! normalization, shuffling, and batching.
+//!
+//! ## Modules
+//!
+//! - [`image`] — Image dataset loading (CIFAR-10), patch encoding, normalization
+
+pub mod image;
 
 /// Load a dataset from a local path.
 pub fn load_dataset(_path: &str) -> Result<Vec<(Vec<f32>, Vec<f32>)>, String> {

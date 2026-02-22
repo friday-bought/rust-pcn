@@ -32,6 +32,7 @@ pub mod training;
 pub mod utils;
 
 pub use core::{Activation, IdentityActivation, PCNError, PCNResult, State, TanhActivation, PCN};
+pub use data::image as image_data;
 pub use pool::{BufferPool, PoolStats};
 pub use training::{
     train_batch, train_batch_parallel, train_epoch, train_epoch_parallel, train_sample,

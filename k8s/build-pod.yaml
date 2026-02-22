@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcn-build
+  namespace: pcn-train
+  labels:
+    app: pcn-build
+spec:
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - theshire
+  containers:
+    - name: builder
+      image: ubuntu:24.04
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "=== PCN V2 Build ==="
+          echo "Installing build dependencies..."
+          apt-get update -qq && apt-get install -y -qq build-essential pkg-config libssl-dev git 2>/dev/null | tail -1
+          
+          echo "Setting up Rust toolchain..."
+          export RUSTUP_HOME=/rust/.rustup
+          export CARGO_HOME=/rust/.cargo
+          export PATH="/rust/.cargo/bin:$PATH"
+          
+          echo "Rust version:"
+          rustc --version
+          cargo --version
+          
+          echo ""
+          echo "Building PCN with CUDA feature..."
+          cd /workspace
+          
+          # Build with CUDA feature (no-default-features disables wgpu)
+          cargo build --release --no-default-features --features cuda 2>&1
+          
+          echo ""
+          echo "Build complete!"
+          ls -la target/release/pcn-train
+          echo "Binary size: $(du -h target/release/pcn-train | cut -f1)"
+          echo "Done at $(date)"
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: rust-home
+          mountPath: /rust
+          readOnly: false
+      workingDir: /workspace
+  volumes:
+    - name: workspace
+      hostPath:
+        path: /home/kadajett/dev/rust-pcn
+        type: Directory
+    - name: rust-home
+      hostPath:
+        path: /home/kadajett
+        type: Directory
