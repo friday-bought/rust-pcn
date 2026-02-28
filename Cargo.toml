@@ -3,6 +3,10 @@ name = "pcn"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+gpu = []
+
 [lints.rust]
 unsafe_code = "forbid"
 
@@ -26,6 +30,10 @@ rayon = "1.8"
 [[bin]]
 name = "pcn-train-image"
 path = "src/bin/train_image.rs"
+
+[[bin]]
+name = "pcn-infer-image"
+path = "src/bin/infer_image.rs"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
